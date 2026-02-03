@@ -1,0 +1,9 @@
+torch
+torchvision
+pillow>=8.0.0
+numpy>=1.21.0
+pycocotools>=2.0.4
+ftfy
+regex
+tqdm
+git+https://github.com/openai/CLIP.git
