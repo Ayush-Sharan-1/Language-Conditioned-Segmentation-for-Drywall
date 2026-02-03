@@ -70,15 +70,25 @@ class CrackSegmentationDataset(Dataset):
     
     def _polygon_to_mask(self, polygon: List[List[float]], height: int, width: int) -> np.ndarray:
         """Convert polygon annotation to binary mask."""
+        # Handle empty polygon
+        if not polygon or len(polygon) == 0:
+            return np.zeros((height, width), dtype=np.uint8)
+        
         # Flatten polygon coordinates
         if isinstance(polygon[0], list):
             # Multiple polygons or single polygon
             if len(polygon) == 1:
+                # Check if inner polygon is empty
+                if not polygon[0] or len(polygon[0]) == 0:
+                    return np.zeros((height, width), dtype=np.uint8)
                 coords = np.array(polygon[0], dtype=np.float32).reshape(-1, 2)
             else:
                 # Multiple polygons - combine them
                 mask = np.zeros((height, width), dtype=np.uint8)
                 for poly in polygon:
+                    # Skip empty polygons
+                    if not poly or len(poly) == 0:
+                        continue
                     coords = np.array(poly, dtype=np.float32).reshape(-1, 2)
                     # Create mask for this polygon
                     from PIL import Image, ImageDraw
@@ -89,6 +99,9 @@ class CrackSegmentationDataset(Dataset):
                     mask = np.maximum(mask, poly_mask)
                 return mask.astype(np.float32)
         else:
+            # Flat list of coordinates
+            if len(polygon) == 0:
+                return np.zeros((height, width), dtype=np.uint8)
             coords = np.array(polygon, dtype=np.float32).reshape(-1, 2)
         
         # Create mask from polygon

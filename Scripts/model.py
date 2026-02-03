@@ -324,4 +324,26 @@ class LanguageConditionedSegmentationModel(nn.Module):
         logits = self.segmentation_model(image, text_embedding)
         
         return logits
+    
+    def forward_with_embedding(self, image: torch.Tensor, text_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with pre-computed text embedding.
+        
+        Args:
+            image: Input image [B, 3, H, W]
+            text_embedding: Pre-computed text embedding [1, text_dim] or [B, text_dim]
+        
+        Returns:
+            Logits [B, 1, H, W]
+        """
+        # Expand text embedding to batch size if needed
+        batch_size = image.shape[0]
+        if text_embedding.shape[0] == 1:
+            text_embedding = text_embedding.expand(batch_size, -1)
+        text_embedding = text_embedding.to(image.device)  # [B, text_dim]
+        
+        # Forward through segmentation model
+        logits = self.segmentation_model(image, text_embedding)
+        
+        return logits
 

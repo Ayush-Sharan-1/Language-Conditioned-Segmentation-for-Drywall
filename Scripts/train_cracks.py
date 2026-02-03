@@ -8,7 +8,7 @@ import argparse
 import random
 import numpy as np
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -32,7 +32,8 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # Enable cuDNN benchmarking for better performance (after seed is set)
+    torch.backends.cudnn.benchmark = True
 
 
 def compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
@@ -74,9 +75,12 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
+    prompt_embeddings_cache: Dict[str, torch.Tensor],
     prompts: Dict[str, list],
     writer: SummaryWriter,
     global_step: int,
+    scaler: Optional[torch.amp.GradScaler],
+    use_amp: bool,
     class_name: str = "crack"
 ) -> Tuple[Dict[str, float], int]:
     """Train for one epoch."""
@@ -92,26 +96,43 @@ def train_epoch(
     dice_loss_fn = DiceLoss()
     
     for batch_idx, (images, masks, labels) in enumerate(dataloader):
-        images = images.to(device)
-        masks = masks.to(device)
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
         
-        # Sample prompt for this batch
+        # Convert to channels_last memory format for better performance on CUDA
+        if use_amp:  # Only when using CUDA (use_amp is True only for CUDA)
+            images = images.to(memory_format=torch.channels_last)
+            masks = masks.to(memory_format=torch.channels_last)
+        
+        # Sample prompt for this batch and retrieve cached embedding
         prompt = sample_prompt(class_name, prompts, is_training=True)
+        text_embedding = prompt_embeddings_cache[prompt].to(device)
         
         # Forward pass
         optimizer.zero_grad()
-        logits = model(images, prompt)
         
-        # Compute loss
-        loss = criterion(logits, masks)
-        
-        # Compute individual loss components for logging
-        bce_loss = bce_loss_fn(logits, masks)
-        dice_loss = dice_loss_fn(logits, masks)
-        
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                logits = model.forward_with_embedding(images, text_embedding)
+                loss = criterion(logits, masks)
+                # Compute individual loss components for logging
+                bce_loss = bce_loss_fn(logits, masks)
+                dice_loss = dice_loss_fn(logits, masks)
+            
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model.forward_with_embedding(images, text_embedding)
+            loss = criterion(logits, masks)
+            # Compute individual loss components for logging
+            bce_loss = bce_loss_fn(logits, masks)
+            dice_loss = dice_loss_fn(logits, masks)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
         
         total_loss += loss.item()
         total_bce_loss += bce_loss.item()
@@ -143,7 +164,8 @@ def validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    prompts: Dict[str, list],
+    prompt_embeddings_cache: Dict[str, torch.Tensor],
+    use_amp: bool,
     class_name: str = "crack"
 ) -> Dict[str, float]:
     """Validate model."""
@@ -156,17 +178,26 @@ def validate(
     
     # Use fixed prompt for validation
     val_prompt = "segment crack"
+    val_text_embedding = prompt_embeddings_cache[val_prompt].to(device)
     
     with torch.no_grad():
         for images, masks, labels in dataloader:
-            images = images.to(device)
-            masks = masks.to(device)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            
+            # Convert to channels_last memory format for better performance on CUDA
+            if use_amp:  # Only when using CUDA (use_amp is True only for CUDA)
+                images = images.to(memory_format=torch.channels_last)
+                masks = masks.to(memory_format=torch.channels_last)
             
             # Forward pass
-            logits = model(images, val_prompt)
-            
-            # Compute loss
-            loss = criterion(logits, masks)
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    logits = model.forward_with_embedding(images, val_text_embedding)
+                    loss = criterion(logits, masks)
+            else:
+                logits = model.forward_with_embedding(images, val_text_embedding)
+                loss = criterion(logits, masks)
             
             # Compute metrics
             metrics = compute_metrics(logits, masks)
@@ -192,6 +223,8 @@ def save_predictions(
     dataloader: DataLoader,
     device: torch.device,
     output_dir: Path,
+    prompt_embeddings_cache: Dict[str, torch.Tensor],
+    use_amp: bool,
     num_samples: int = 5
 ):
     """Save prediction visualizations for a few validation samples."""
@@ -199,6 +232,7 @@ def save_predictions(
     
     output_dir.mkdir(parents=True, exist_ok=True)
     val_prompt = "segment crack"
+    val_text_embedding = prompt_embeddings_cache[val_prompt].to(device)
     
     saved_count = 0
     
@@ -207,11 +241,20 @@ def save_predictions(
             if saved_count >= num_samples:
                 break
             
-            images = images.to(device)
-            masks = masks.to(device)
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            
+            # Convert to channels_last memory format for better performance on CUDA
+            if use_amp:  # Only when using CUDA (use_amp is True only for CUDA)
+                images = images.to(memory_format=torch.channels_last)
+                masks = masks.to(memory_format=torch.channels_last)
             
             # Forward pass
-            logits = model(images, val_prompt)
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    logits = model.forward_with_embedding(images, val_text_embedding)
+            else:
+                logits = model.forward_with_embedding(images, val_text_embedding)
             pred_probs = torch.sigmoid(logits)
             pred_binary = (pred_probs > 0.5).float()
             
@@ -253,6 +296,46 @@ def freeze_encoder(model: nn.Module):
     print("Frozen encoder layers")
 
 
+def cache_prompt_embeddings(
+    model: nn.Module,
+    prompts: Dict[str, list],
+    device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """
+    Cache CLIP text embeddings for all prompts.
+    
+    Args:
+        model: LanguageConditionedSegmentationModel with CLIP text encoder
+        prompts: Dictionary mapping class names to lists of prompt strings
+        device: Device to run encoding on
+    
+    Returns:
+        Dictionary mapping prompt strings to embedding tensors
+    """
+    print("Caching CLIP text embeddings for all prompts...")
+    embeddings_cache = {}
+    
+    # Collect all unique prompts
+    all_prompts = set()
+    for prompt_list in prompts.values():
+        all_prompts.update(prompt_list)
+    
+    # Also add validation prompt
+    all_prompts.add("segment crack")
+    
+    # Encode all prompts once
+    model.text_encoder.eval()
+    with torch.no_grad():
+        for prompt in all_prompts:
+            # Use the existing CLIPTextEncoder.forward() method which handles tokenization correctly
+            text_embedding = model.text_encoder(prompt)
+            # Store as CPU tensor to save GPU memory, move to device when needed
+            embeddings_cache[prompt] = text_embedding.cpu()
+    
+    print(f"Cached {len(embeddings_cache)} prompt embeddings")
+    return embeddings_cache
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train language-conditioned crack segmentation model")
     
@@ -282,7 +365,11 @@ def main():
     parser.add_argument("--output_dir", type=str, default="checkpoints",
                         help="Directory to save checkpoints and outputs")
     parser.add_argument("--save_predictions", action="store_true",
-                        help="Save prediction visualizations")
+                        help="Save prediction visualizations (only after training completes)")
+    
+    # Validation settings
+    parser.add_argument("--val_every_n_epochs", type=int, default=1,
+                        help="Run validation every N epochs (default: 1)")
     
     args = parser.parse_args()
     
@@ -348,10 +435,25 @@ def main():
     model = LanguageConditionedSegmentationModel(clip_model_name=args.clip_model, device=device_str)
     model = model.to(device)
     
+    # Use channels_last memory format for better performance on CUDA
+    use_channels_last = cuda_available
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
+        print("Using channels_last memory format")
+    
     # Freeze CLIP text encoder (already frozen in model definition)
     # Optionally freeze encoder
     if args.freeze_encoder:
         freeze_encoder(model)
+    
+    # Cache CLIP text embeddings for all prompts
+    prompt_embeddings_cache = cache_prompt_embeddings(model, prompts, device)
+    
+    # Enable mixed precision training (AMP) for CUDA
+    use_amp = cuda_available
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    if use_amp:
+        print("Mixed precision training (AMP) enabled")
     
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -408,62 +510,71 @@ def main():
     for epoch in range(args.num_epochs):
         # Train
         train_metrics, global_step = train_epoch(
-            model, train_loader, optimizer, criterion, device, prompts, 
-            writer, global_step, class_name="crack"
+            model, train_loader, optimizer, criterion, device, 
+            prompt_embeddings_cache, prompts, writer, global_step, 
+            scaler, use_amp, class_name="crack"
         )
         
-        # Validate
-        val_metrics = validate(
-            model, val_loader, criterion, device, prompts, class_name="crack"
-        )
-        
-        # Get current learning rate
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # Log validation metrics (once per epoch)
-        writer.add_scalar('val/loss', val_metrics['loss'], epoch)
-        writer.add_scalar('val/dice', val_metrics['dice'], epoch)
-        writer.add_scalar('val/iou', val_metrics['iou'], epoch)
-        
-        # Log learning rate (once per epoch)
-        writer.add_scalar('lr', current_lr, epoch)
-        
-        # Learning rate scheduling
-        old_lr = current_lr
-        scheduler.step(val_metrics['loss'])
-        new_lr = optimizer.param_groups[0]['lr']
-        if new_lr != old_lr:
-            print(f"  Learning rate reduced: {old_lr:.2e} -> {new_lr:.2e}")
-        
-        # Console logging: one line per epoch
-        print(f"Epoch {epoch + 1}/{args.num_epochs} | "
-              f"Train Loss: {train_metrics['loss']:.4f} | "
-              f"Val Dice: {val_metrics['dice']:.4f} | "
-              f"LR: {current_lr:.2e}")
-        
-        # Save best model
-        if val_metrics['dice'] > best_val_dice:
-            best_val_dice = val_metrics['dice']
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_dice': val_metrics['dice'],
-                'val_iou': val_metrics['iou'],
-                'config': config
-            }, output_dir / "best_model.pth")
-            print(f"  ✓ Saved best model (Dice: {best_val_dice:.4f})")
-        
-        # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_dice': val_metrics['dice'],
-                'val_iou': val_metrics['iou'],
-                'config': config
-            }, output_dir / f"checkpoint_epoch_{epoch + 1}.pth")
+        # Validate only every N epochs
+        if (epoch + 1) % args.val_every_n_epochs == 0:
+            val_metrics = validate(
+                model, val_loader, criterion, device, 
+                prompt_embeddings_cache, use_amp, class_name="crack"
+            )
+            
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Log validation metrics (once per epoch)
+            writer.add_scalar('val/loss', val_metrics['loss'], epoch)
+            writer.add_scalar('val/dice', val_metrics['dice'], epoch)
+            writer.add_scalar('val/iou', val_metrics['iou'], epoch)
+            
+            # Log learning rate (once per epoch)
+            writer.add_scalar('lr', current_lr, epoch)
+            
+            # Learning rate scheduling
+            old_lr = current_lr
+            scheduler.step(val_metrics['loss'])
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr != old_lr:
+                print(f"  Learning rate reduced: {old_lr:.2e} -> {new_lr:.2e}")
+            
+            # Console logging: one line per epoch
+            print(f"Epoch {epoch + 1}/{args.num_epochs} | "
+                  f"Train Loss: {train_metrics['loss']:.4f} | "
+                  f"Val Dice: {val_metrics['dice']:.4f} | "
+                  f"LR: {current_lr:.2e}")
+            
+            # Save best model
+            if val_metrics['dice'] > best_val_dice:
+                best_val_dice = val_metrics['dice']
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_dice': val_metrics['dice'],
+                    'val_iou': val_metrics['iou'],
+                    'config': config
+                }, output_dir / "best_model.pth")
+                print(f"  ✓ Saved best model (Dice: {best_val_dice:.4f})")
+            
+            # Save checkpoint every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_dice': val_metrics['dice'],
+                    'val_iou': val_metrics['iou'],
+                    'config': config
+                }, output_dir / f"checkpoint_epoch_{epoch + 1}.pth")
+        else:
+            # No validation this epoch, just log training metrics
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch + 1}/{args.num_epochs} | "
+                  f"Train Loss: {train_metrics['loss']:.4f} | "
+                  f"LR: {current_lr:.2e} (validation skipped)")
     
     # Close TensorBoard writer
     writer.close()
@@ -471,12 +582,14 @@ def main():
     print(f"\nTraining completed! Best validation Dice: {best_val_dice:.4f}")
     print(f"TensorBoard logs saved to: {log_dir}")
     
-    # Save predictions for a few validation samples
+    # Save predictions for a few validation samples (only after training completes)
     if args.save_predictions:
         print("\nSaving prediction visualizations...")
         save_predictions(
             model, val_loader, device,
             output_dir / "predictions",
+            prompt_embeddings_cache,
+            use_amp,
             num_samples=10
         )
 
