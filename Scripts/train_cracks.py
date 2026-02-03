@@ -496,25 +496,38 @@ def main():
             checkpoint = torch.load(args.resume, map_location=device)
             
             # Load model state
-            model.load_state_dict(checkpoint['model_state_dict'])
+            try:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("  ✓ Model state loaded")
+            except Exception as e:
+                print(f"  ✗ Error loading model state: {e}")
+                print("  Starting training from scratch...")
+                args.resume = None  # Disable resume if model loading fails
             
-            # Load optimizer state
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            # Get starting epoch (epoch in checkpoint is 1-indexed, so subtract 1 for 0-indexed loop)
-            start_epoch = checkpoint.get('epoch', 0)
-            if start_epoch > 0:
-                start_epoch -= 1  # Convert to 0-indexed for range()
-            
-            # Restore best validation dice
-            best_val_dice = checkpoint.get('val_dice', 0.0)
-            
-            # Note: ReduceLROnPlateau doesn't have state_dict, so we can't restore scheduler state
-            # The scheduler will continue from the current learning rate
-            
-            print(f"  Resumed from epoch {start_epoch + 1}")
-            print(f"  Best validation Dice so far: {best_val_dice:.4f}")
-            print(f"  Current learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+            if args.resume:  # Only continue if model loaded successfully
+                # Try to load optimizer state (may fail if trainable params changed)
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("  ✓ Optimizer state loaded")
+                except Exception as e:
+                    print(f"  ⚠ Warning: Could not load optimizer state: {e}")
+                    print("  Continuing with fresh optimizer state (momentum will be reset)")
+                    # Optimizer will use current learning rate from args
+                
+                # Get starting epoch (epoch in checkpoint is 1-indexed, so subtract 1 for 0-indexed loop)
+                start_epoch = checkpoint.get('epoch', 0)
+                if start_epoch > 0:
+                    start_epoch -= 1  # Convert to 0-indexed for range()
+                
+                # Restore best validation dice
+                best_val_dice = checkpoint.get('val_dice', 0.0)
+                
+                # Note: ReduceLROnPlateau doesn't have state_dict, so we can't restore scheduler state
+                # The scheduler will continue from the current learning rate
+                
+                print(f"  Resumed from epoch {start_epoch + 1}")
+                print(f"  Best validation Dice so far: {best_val_dice:.4f}")
+                print(f"  Current learning rate: {optimizer.param_groups[0]['lr']:.2e}")
         else:
             print(f"Warning: Checkpoint file not found: {args.resume}")
             print("Starting training from scratch...")
