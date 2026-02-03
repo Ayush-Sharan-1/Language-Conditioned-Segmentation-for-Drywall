@@ -41,6 +41,9 @@ ENV/
 *.pt
 checkpoints/
 
+# TensorBoard
+runs/
+
 # Logs
 *.log
 logs/

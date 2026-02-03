@@ -13,13 +13,15 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torchvision.transforms as transforms
+from datetime import datetime
 
 from dataset import CrackSegmentationDataset
 from model import LanguageConditionedSegmentationModel
-from losses import CombinedLoss
+from losses import CombinedLoss, DiceLoss
 from utils import load_prompts, sample_prompt
 
 
@@ -73,13 +75,21 @@ def train_epoch(
     criterion: nn.Module,
     device: torch.device,
     prompts: Dict[str, list],
+    writer: SummaryWriter,
+    global_step: int,
     class_name: str = "crack"
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], int]:
     """Train for one epoch."""
     model.train()
     
     total_loss = 0.0
+    total_bce_loss = 0.0
+    total_dice_loss = 0.0
     num_batches = 0
+    
+    # Individual loss components for logging
+    bce_loss_fn = nn.BCEWithLogitsLoss()
+    dice_loss_fn = DiceLoss()
     
     for batch_idx, (images, masks, labels) in enumerate(dataloader):
         images = images.to(device)
@@ -95,19 +105,37 @@ def train_epoch(
         # Compute loss
         loss = criterion(logits, masks)
         
+        # Compute individual loss components for logging
+        bce_loss = bce_loss_fn(logits, masks)
+        dice_loss = dice_loss_fn(logits, masks)
+        
         # Backward pass
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
+        total_bce_loss += bce_loss.item()
+        total_dice_loss += dice_loss.item()
         num_batches += 1
         
+        # Log every 10 iterations
         if (batch_idx + 1) % 10 == 0:
+            writer.add_scalar('train/total_loss', loss.item(), global_step)
+            writer.add_scalar('train/bce_loss', bce_loss.item(), global_step)
+            writer.add_scalar('train/dice_loss', dice_loss.item(), global_step)
+            global_step += 1
+            
             print(f"  Batch {batch_idx + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Prompt: {prompt}")
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_bce_loss = total_bce_loss / num_batches if num_batches > 0 else 0.0
+    avg_dice_loss = total_dice_loss / num_batches if num_batches > 0 else 0.0
     
-    return {'loss': avg_loss}
+    return {
+        'loss': avg_loss,
+        'bce_loss': avg_bce_loss,
+        'dice_loss': avg_dice_loss
+    }, global_step
 
 
 def validate(
@@ -261,9 +289,21 @@ def main():
     # Set random seed
     set_seed(args.seed)
     
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Device detection with diagnostics
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
+        device = torch.device("cuda")
+        print(f"Using device: {device}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        device = torch.device("cpu")
+        print(f"Using device: {device}")
+        print("CUDA not available.")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA compiled version: {torch.version.cuda if hasattr(torch.version, 'cuda') else 'N/A'}")
+
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -328,10 +368,21 @@ def main():
     )
     
     # Learning rate scheduler
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    # Create TensorBoard writer
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"crack_attention_unet_v1_{timestamp}"
+    log_dir = Path("runs") / run_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
+    
+    print(f"TensorBoard logs: {log_dir}")
+    print(f"View with: tensorboard --logdir runs/")
     
     # Training loop
     best_val_dice = 0.0
+    global_step = 0
     
     # Save training config
     config = {
@@ -342,7 +393,8 @@ def main():
         'clip_model': args.clip_model,
         'freeze_encoder': args.freeze_encoder,
         'trainable_params': trainable_params,
-        'total_params': total_params
+        'total_params': total_params,
+        'tensorboard_run': run_name
     }
     
     with open(output_dir / "config.json", 'w') as f:
@@ -354,23 +406,40 @@ def main():
     print(f"Output directory: {output_dir}\n")
     
     for epoch in range(args.num_epochs):
-        print(f"Epoch {epoch + 1}/{args.num_epochs}")
-        
         # Train
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, criterion, device, prompts, class_name="crack"
+        train_metrics, global_step = train_epoch(
+            model, train_loader, optimizer, criterion, device, prompts, 
+            writer, global_step, class_name="crack"
         )
-        print(f"  Train Loss: {train_metrics['loss']:.4f}")
         
         # Validate
         val_metrics = validate(
             model, val_loader, criterion, device, prompts, class_name="crack"
         )
-        print(f"  Val Loss: {val_metrics['loss']:.4f}, "
-              f"Dice: {val_metrics['dice']:.4f}, IoU: {val_metrics['iou']:.4f}")
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Log validation metrics (once per epoch)
+        writer.add_scalar('val/loss', val_metrics['loss'], epoch)
+        writer.add_scalar('val/dice', val_metrics['dice'], epoch)
+        writer.add_scalar('val/iou', val_metrics['iou'], epoch)
+        
+        # Log learning rate (once per epoch)
+        writer.add_scalar('lr', current_lr, epoch)
         
         # Learning rate scheduling
+        old_lr = current_lr
         scheduler.step(val_metrics['loss'])
+        new_lr = optimizer.param_groups[0]['lr']
+        if new_lr != old_lr:
+            print(f"  Learning rate reduced: {old_lr:.2e} -> {new_lr:.2e}")
+        
+        # Console logging: one line per epoch
+        print(f"Epoch {epoch + 1}/{args.num_epochs} | "
+              f"Train Loss: {train_metrics['loss']:.4f} | "
+              f"Val Dice: {val_metrics['dice']:.4f} | "
+              f"LR: {current_lr:.2e}")
         
         # Save best model
         if val_metrics['dice'] > best_val_dice:
@@ -383,7 +452,7 @@ def main():
                 'val_iou': val_metrics['iou'],
                 'config': config
             }, output_dir / "best_model.pth")
-            print(f"  Saved best model (Dice: {best_val_dice:.4f})")
+            print(f"  ✓ Saved best model (Dice: {best_val_dice:.4f})")
         
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -395,10 +464,12 @@ def main():
                 'val_iou': val_metrics['iou'],
                 'config': config
             }, output_dir / f"checkpoint_epoch_{epoch + 1}.pth")
-        
-        print()
     
-    print(f"Training completed! Best validation Dice: {best_val_dice:.4f}")
+    # Close TensorBoard writer
+    writer.close()
+    
+    print(f"\nTraining completed! Best validation Dice: {best_val_dice:.4f}")
+    print(f"TensorBoard logs saved to: {log_dir}")
     
     # Save predictions for a few validation samples
     if args.save_predictions:
