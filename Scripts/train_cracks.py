@@ -371,6 +371,10 @@ def main():
     parser.add_argument("--val_every_n_epochs", type=int, default=1,
                         help="Run validation every N epochs (default: 1)")
     
+    # Resume training
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume training from (e.g., checkpoints/best_model.pth)")
+    
     args = parser.parse_args()
     
     # Set random seed
@@ -482,8 +486,40 @@ def main():
     print(f"TensorBoard logs: {log_dir}")
     print(f"View with: tensorboard --logdir runs/")
     
-    # Training loop
+    # Resume from checkpoint if specified
+    start_epoch = 0
     best_val_dice = 0.0
+    
+    if args.resume:
+        if Path(args.resume).exists():
+            print(f"\nResuming training from checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load model state
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Load optimizer state
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Get starting epoch (epoch in checkpoint is 1-indexed, so subtract 1 for 0-indexed loop)
+            start_epoch = checkpoint.get('epoch', 0)
+            if start_epoch > 0:
+                start_epoch -= 1  # Convert to 0-indexed for range()
+            
+            # Restore best validation dice
+            best_val_dice = checkpoint.get('val_dice', 0.0)
+            
+            # Note: ReduceLROnPlateau doesn't have state_dict, so we can't restore scheduler state
+            # The scheduler will continue from the current learning rate
+            
+            print(f"  Resumed from epoch {start_epoch + 1}")
+            print(f"  Best validation Dice so far: {best_val_dice:.4f}")
+            print(f"  Current learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+        else:
+            print(f"Warning: Checkpoint file not found: {args.resume}")
+            print("Starting training from scratch...")
+    
+    # Training loop
     global_step = 0
     
     # Save training config
@@ -505,9 +541,13 @@ def main():
     print("\nStarting training...")
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
-    print(f"Output directory: {output_dir}\n")
+    print(f"Output directory: {output_dir}")
+    if args.resume:
+        print(f"Resuming from epoch {start_epoch + 1}\n")
+    else:
+        print()
     
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         # Train
         train_metrics, global_step = train_epoch(
             model, train_loader, optimizer, criterion, device, 

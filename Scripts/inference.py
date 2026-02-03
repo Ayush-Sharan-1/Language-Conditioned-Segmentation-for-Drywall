@@ -14,6 +14,7 @@ from PIL import Image
 import torchvision.transforms as transforms
 
 from model import LanguageConditionedSegmentationModel
+from dataset import CrackSegmentationDataset
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
@@ -160,20 +161,120 @@ def save_prediction(
     print(f"Saved prediction mask to {output_path}")
 
 
+def compute_metrics_numpy(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
+    """
+    Compute Dice and IoU metrics from numpy arrays.
+    
+    Args:
+        pred_mask: Predicted binary mask [H, W] with values {0, 1}
+        gt_mask: Ground truth binary mask [H, W] with values {0, 1}
+    
+    Returns:
+        Dictionary with 'dice' and 'iou' scores
+    """
+    # Ensure masks are binary
+    pred_mask = (pred_mask > 0.5).astype(np.float32)
+    gt_mask = (gt_mask > 0.5).astype(np.float32)
+    
+    # Flatten masks
+    pred_flat = pred_mask.flatten()
+    gt_flat = gt_mask.flatten()
+    
+    # Compute intersection and union
+    intersection = np.sum(pred_flat * gt_flat)
+    pred_sum = np.sum(pred_flat)
+    gt_sum = np.sum(gt_flat)
+    union = np.sum(np.clip(pred_flat + gt_flat, 0, 1))
+    
+    # Compute Dice
+    dice = (2.0 * intersection) / (pred_sum + gt_sum + 1e-6)
+    
+    # Compute IoU
+    iou = intersection / (union + 1e-6)
+    
+    return {
+        'dice': float(dice),
+        'iou': float(iou)
+    }
+
+
+def load_ground_truth_mask(image_path: Path, annotations_path: Path) -> Optional[np.ndarray]:
+    """
+    Load ground truth mask for an image from COCO annotations.
+    
+    Args:
+        image_path: Path to the image file
+        annotations_path: Path to COCO annotations JSON file
+    
+    Returns:
+        Ground truth mask as numpy array [H, W] or None if not found
+    """
+    if not annotations_path.exists():
+        return None
+    
+    try:
+        # Load COCO annotations
+        with open(annotations_path, 'r') as f:
+            coco_data = json.load(f)
+        
+        # Find image in annotations
+        image_name = image_path.name
+        image_info = None
+        for img in coco_data['images']:
+            if img['file_name'] == image_name:
+                image_info = img
+                break
+        
+        if image_info is None:
+            return None
+        
+        # Get annotations for this image
+        annotations = [
+            ann for ann in coco_data['annotations']
+            if ann['image_id'] == image_info['id']
+        ]
+        
+        if len(annotations) == 0:
+            return None
+        
+        # Create dataset instance to use its mask conversion methods
+        # We'll create a temporary dataset just to use the mask conversion
+        from dataset import CrackSegmentationDataset
+        temp_dataset = CrackSegmentationDataset(
+            annotations_path=str(annotations_path),
+            images_dir=str(image_path.parent),
+            split="valid"
+        )
+        
+        # Convert annotations to mask
+        height = image_info['height']
+        width = image_info['width']
+        mask = temp_dataset._annotations_to_mask(annotations, height, width)
+        
+        return mask
+        
+    except Exception as e:
+        print(f"  Warning: Could not load ground truth mask: {e}")
+        return None
+
+
 def visualize_prediction(
     image_path: str,
     mask: np.ndarray,
     output_path: str,
-    alpha: float = 0.5
+    alpha: float = 0.5,
+    gt_mask: Optional[np.ndarray] = None
 ):
     """
     Create visualization overlay of prediction on original image.
+    If gt_mask is provided, creates side-by-side comparison.
     
     Args:
         image_path: Path to original image
         mask: Binary mask [H, W] with values {0, 1}
         output_path: Path to save visualization
         alpha: Transparency of overlay (default: 0.5)
+        gt_mask: Optional ground truth mask for side-by-side comparison
     """
     # Load original image
     image = Image.open(image_path).convert('RGB')
@@ -196,23 +297,47 @@ def visualize_prediction(
     # Ensure mask is in [0, 1] range
     mask = np.clip(mask, 0, 1)
     
-    # Create overlay
-    overlay = image_array.astype(np.float32).copy()
+    def create_overlay(img_array, msk, title=""):
+        """Helper function to create overlay visualization."""
+        overlay = img_array.astype(np.float32).copy()
+        mask_3d = np.stack([msk] * 3, axis=-1)  # [H, W, 3]
+        red_overlay = np.array([255, 0, 0], dtype=np.float32)  # Red color
+        overlay = np.where(mask_3d > 0.5, 
+                          overlay * (1 - alpha) + red_overlay * alpha,
+                          overlay)
+        return overlay.astype(np.uint8)
     
-    # Apply red overlay where mask is 1
-    # Create 3D mask for RGB channels
-    mask_3d = np.stack([mask] * 3, axis=-1)  # [H, W, 3]
+    # Create prediction overlay
+    pred_overlay = create_overlay(image_array, mask)
     
-    # Apply overlay: blend original with red where mask > 0.5
-    red_overlay = np.array([255, 0, 0], dtype=np.float32)  # Red color
-    overlay = np.where(mask_3d > 0.5, 
-                      overlay * (1 - alpha) + red_overlay * alpha,
-                      overlay)
-    
-    # Save visualization
-    overlay_image = Image.fromarray(overlay.astype(np.uint8))
-    overlay_image.save(output_path)
-    print(f"Saved visualization to {output_path}")
+    # If ground truth mask provided, create side-by-side comparison
+    if gt_mask is not None:
+        # Process ground truth mask
+        if gt_mask.ndim > 2:
+            gt_mask = gt_mask.squeeze()
+        gt_mask_height, gt_mask_width = gt_mask.shape[:2]
+        if (gt_mask_height, gt_mask_width) != (image_height, image_width):
+            gt_mask_pil = Image.fromarray((gt_mask * 255).astype(np.uint8), mode='L')
+            gt_mask_pil = gt_mask_pil.resize((image_width, image_height), Image.NEAREST)
+            gt_mask = np.array(gt_mask_pil, dtype=np.float32) / 255.0
+        gt_mask = np.clip(gt_mask, 0, 1)
+        
+        # Create ground truth overlay
+        gt_overlay = create_overlay(image_array, gt_mask)
+        
+        # Create side-by-side image
+        combined = np.hstack([pred_overlay, gt_overlay])
+        
+        # Add text labels (simple approach - could use PIL ImageDraw for better text)
+        # For now, save as is - labels can be added with image editing tools if needed
+        combined_image = Image.fromarray(combined)
+        combined_image.save(output_path)
+        print(f"Saved side-by-side visualization (Prediction | Ground Truth) to {output_path}")
+    else:
+        # Single image with prediction overlay
+        overlay_image = Image.fromarray(pred_overlay)
+        overlay_image.save(output_path)
+        print(f"Saved visualization to {output_path}")
 
 
 def main():
@@ -233,7 +358,7 @@ def main():
     parser.add_argument("--num_images", type=int, default=None,
                         help="Number of images to process from folder (default: all images)")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="Output directory for batch inference results (default: <folder>/predictions)")
+                        help="Output directory for batch inference results (default: same as input folder)")
     
     # Optional arguments
     parser.add_argument("--prompt", type=str, default="segment crack",
@@ -342,11 +467,32 @@ def main():
             vis_dir = output_dir / "visualizations"
             vis_dir.mkdir(parents=True, exist_ok=True)
         
+        # Try to find COCO annotations file for ground truth masks
+        annotations_path = None
+        # Check common locations for annotations
+        possible_annotation_paths = [
+            folder_path / "_annotations.coco.json",
+            folder_path.parent / folder_path.name / "_annotations.coco.json",
+            folder_path.parent.parent / folder_path.name / "_annotations.coco.json"
+        ]
+        for ann_path in possible_annotation_paths:
+            if ann_path.exists():
+                annotations_path = ann_path
+                print(f"Found annotations file: {annotations_path}")
+                break
+        
+        if annotations_path is None:
+            print("Warning: No COCO annotations file found. Metrics and ground truth comparison will be skipped.")
+        
         # Process each image
         print(f"\nProcessing images with prompt: '{args.prompt}'...")
         print(f"Output directory: {output_dir}")
         
         total_coverage = 0.0
+        total_dice = 0.0
+        total_iou = 0.0
+        metrics_count = 0
+        
         for idx, image_file in enumerate(image_files, 1):
             print(f"\n[{idx}/{len(image_files)}] Processing: {image_file.name}")
             
@@ -363,7 +509,21 @@ def main():
                 coverage = (mask_area / total_pixels) * 100
                 total_coverage += coverage
                 
-                print(f"  Coverage: {coverage:.2f}% ({mask_area}/{total_pixels} pixels)")
+                # Load ground truth mask if available
+                gt_mask = None
+                if annotations_path:
+                    gt_mask = load_ground_truth_mask(image_file, annotations_path)
+                
+                # Compute metrics if ground truth available
+                metrics_str = ""
+                if gt_mask is not None:
+                    metrics = compute_metrics_numpy(mask, gt_mask)
+                    total_dice += metrics['dice']
+                    total_iou += metrics['iou']
+                    metrics_count += 1
+                    metrics_str = f" | Dice: {metrics['dice']:.4f} | IoU: {metrics['iou']:.4f}"
+                
+                print(f"  Coverage: {coverage:.2f}% ({mask_area}/{total_pixels} pixels){metrics_str}")
                 
                 # Save prediction mask
                 output_path = output_dir / f"{image_file.stem}_mask.png"
@@ -372,7 +532,7 @@ def main():
                 # Save visualization if requested
                 if args.save_visualizations:
                     vis_path = vis_dir / f"{image_file.stem}_overlay.png"
-                    visualize_prediction(str(image_file), mask, str(vis_path))
+                    visualize_prediction(str(image_file), mask, str(vis_path), gt_mask=gt_mask)
                 
             except Exception as e:
                 print(f"  Error processing {image_file.name}: {e}")
@@ -383,6 +543,15 @@ def main():
         print(f"\n=== Batch Inference Summary ===")
         print(f"Processed: {len(image_files)} image(s)")
         print(f"Average coverage: {avg_coverage:.2f}%")
+        
+        if metrics_count > 0:
+            avg_dice = total_dice / metrics_count
+            avg_iou = total_iou / metrics_count
+            print(f"Average Dice: {avg_dice:.4f}")
+            print(f"Average IoU (mIoU): {avg_iou:.4f}")
+        else:
+            print("Metrics: Not available (no ground truth annotations found)")
+        
         print(f"Output directory: {output_dir}")
         print("Inference completed!")
 
