@@ -1,7 +1,7 @@
 {
-  "data_root": "Dataset/drywall-pre/train",
-  "annotations_path": "Dataset/drywall-pre/train/_annotations.coco.json",
-  "output_dir": "Dataset/drywall-post",
+  "data_root": "Dataset/drywall-pre/valid",
+  "annotations_path": "Dataset/drywall-pre/valid/_annotations.coco.json",
+  "output_dir": "Dataset/drywall-post/valid",
   "num_images": null,
   "edge_detector_type": "canny",
   "canny_low_threshold": 20.0,
