@@ -16,7 +16,7 @@ Example:
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -28,6 +28,13 @@ try:
 except ImportError:
     FRANGI_AVAILABLE = False
     print("Warning: scikit-image not available. Frangi ridge detection will be disabled.")
+
+try:
+    import pycocotools.mask as mask_utils
+    PYCOCOTOOLS_AVAILABLE = True
+except ImportError:
+    PYCOCOTOOLS_AVAILABLE = False
+    print("Warning: pycocotools not available. COCO format output will be disabled.")
 
 
 def load_coco_annotations(annotations_path: str) -> Dict:
@@ -585,6 +592,50 @@ def process_single_bbox(
     return mask_full
 
 
+def mask_to_coco_segmentation(mask: np.ndarray, use_rle: bool = True) -> Union[Dict, List]:
+    """
+    Convert binary mask to COCO segmentation format (RLE or polygon).
+    
+    Args:
+        mask: Binary mask [H, W] with values {0, 255} or {0, 1}
+        use_rle: If True, return RLE format; if False, return polygon format
+    
+    Returns:
+        COCO segmentation format (dict with RLE or list of polygons)
+    """
+    # Ensure mask is binary uint8
+    if mask.dtype != np.uint8:
+        mask = (mask > 0).astype(np.uint8) * 255
+    
+    # Convert to binary {0, 1}
+    mask_binary = (mask > 127).astype(np.uint8)
+    
+    if not PYCOCOTOOLS_AVAILABLE:
+        # Fallback: return empty polygon if pycocotools not available
+        return []
+    
+    if use_rle:
+        # Convert to RLE format
+        rle = mask_utils.encode(np.asfortranarray(mask_binary))
+        # Convert counts from bytes to string for JSON serialization
+        if isinstance(rle['counts'], bytes):
+            rle['counts'] = rle['counts'].decode('utf-8')
+        return rle
+    else:
+        # Convert to polygon format
+        # Find contours
+        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        polygons = []
+        for contour in contours:
+            # Flatten contour to [x1, y1, x2, y2, ...] format
+            if len(contour) >= 3:  # Need at least 3 points for a polygon
+                polygon = contour.reshape(-1, 2).flatten().tolist()
+                polygons.append(polygon)
+        
+        return polygons if polygons else []
+
+
 def create_visualization(
     image: np.ndarray,
     mask: np.ndarray,
@@ -667,8 +718,10 @@ def process_dataset(
     output_path = Path(output_dir)
     masks_dir = output_path / "masks"
     visualizations_dir = output_path / "visualizations"
+    train_dir = output_path / "train"
     masks_dir.mkdir(parents=True, exist_ok=True)
     visualizations_dir.mkdir(parents=True, exist_ok=True)
+    train_dir.mkdir(parents=True, exist_ok=True)
     
     # Load annotations
     print(f"Loading annotations from {annotations_path}...")
@@ -690,6 +743,32 @@ def process_dataset(
     
     print(f"Processing {len(image_ids)} images...")
     
+    # Initialize COCO format data structure
+    coco_output = {
+        "info": {
+            "description": "Pseudo segmentation masks generated from bounding box annotations",
+            "version": "1.0"
+        },
+        "licenses": [],
+        "images": [],
+        "annotations": [],
+        "categories": coco_data.get("categories", [])
+    }
+    
+    # If no categories exist, create a default one
+    if not coco_output["categories"]:
+        coco_output["categories"] = [{
+            "id": 1,
+            "name": "taping_area",
+            "supercategory": "drywall"
+        }]
+    
+    # Get category ID (use first category or default to 1)
+    category_id = coco_output["categories"][0]["id"] if coco_output["categories"] else 1
+    
+    annotation_id = 1
+    new_image_id = 1
+    
     # Process each image
     for image_id in tqdm(image_ids, desc="Processing images"):
         img_info = images_dict[image_id]
@@ -708,6 +787,11 @@ def process_dataset(
         
         # Convert BGR to RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Copy image to train directory
+        train_img_path = train_dir / img_filename
+        # Save image in RGB format (convert back to BGR for OpenCV save)
+        cv2.imwrite(str(train_img_path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         
         # Initialize combined mask for this image
         combined_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
@@ -758,10 +842,60 @@ def process_dataset(
                 annotations[0]['bbox'],
                 str(vis_path)
             )
+        
+        # Add to COCO format output
+        # Only add if mask has content
+        if np.sum(combined_mask > 0) > 0:
+            # Add image entry
+            coco_output["images"].append({
+                "id": new_image_id,
+                "width": image.shape[1],
+                "height": image.shape[0],
+                "file_name": img_filename
+            })
+            
+            # Convert mask to COCO segmentation format (use RLE for efficiency)
+            segmentation = mask_to_coco_segmentation(combined_mask, use_rle=True)
+            
+            # Compute bounding box from mask
+            y_coords, x_coords = np.where(combined_mask > 0)
+            if len(x_coords) > 0 and len(y_coords) > 0:
+                x_min = float(np.min(x_coords))
+                y_min = float(np.min(y_coords))
+                x_max = float(np.max(x_coords))
+                y_max = float(np.max(y_coords))
+                bbox_coco = [x_min, y_min, x_max - x_min, y_max - y_min]
+                area = float(np.sum(combined_mask > 0))
+            else:
+                bbox_coco = [0.0, 0.0, 0.0, 0.0]
+                area = 0.0
+            
+            # Add annotation entry
+            coco_output["annotations"].append({
+                "id": annotation_id,
+                "image_id": new_image_id,
+                "category_id": category_id,
+                "segmentation": segmentation,
+                "area": area,
+                "bbox": bbox_coco,
+                "iscrowd": 0
+            })
+            
+            annotation_id += 1
+            new_image_id += 1
+    
+    # Save COCO format annotations
+    coco_annotations_path = train_dir / "_annotations.coco.json"
+    with open(coco_annotations_path, 'w') as f:
+        json.dump(coco_output, f, indent=2)
     
     print(f"\nProcessing complete!")
     print(f"Masks saved to: {masks_dir}")
     print(f"Visualizations saved to: {visualizations_dir}")
+    print(f"Train images and COCO annotations saved to: {train_dir}")
+    print(f"COCO annotations file: {coco_annotations_path}")
+    print(f"Total images in COCO format: {len(coco_output['images'])}")
+    print(f"Total annotations in COCO format: {len(coco_output['annotations'])}")
 
 
 def load_config(config_path: str) -> Dict:
