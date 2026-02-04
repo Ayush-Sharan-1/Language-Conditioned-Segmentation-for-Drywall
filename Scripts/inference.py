@@ -1,11 +1,8 @@
-"""
-Inference script for language-conditioned crack segmentation model.
-"""
-
 import argparse
 import json
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -98,7 +95,7 @@ def predict(
     prompt: str,
     device: torch.device,
     threshold: float = 0.5
-) -> np.ndarray:
+) -> Tuple[np.ndarray, float]:
     """
     Run inference on a single image.
     
@@ -110,7 +107,7 @@ def predict(
         threshold: Threshold for binary mask (default: 0.5)
     
     Returns:
-        Binary mask as numpy array [H, W] with values {0, 1}
+        Tuple of (binary mask as numpy array [H, W] with values {0, 1}, inference time in seconds)
     """
     # Move image to device
     image_tensor = image_tensor.to(device)
@@ -118,6 +115,9 @@ def predict(
     # Use channels_last format if CUDA
     if device.type == "cuda":
         image_tensor = image_tensor.to(memory_format=torch.channels_last)
+    
+    # Measure inference time
+    start_time = time.perf_counter()
     
     # Run inference
     with torch.no_grad():
@@ -127,10 +127,13 @@ def predict(
         probs = torch.sigmoid(logits)
         pred_mask = (probs > threshold).float()
     
+    # End timing
+    inference_time = time.perf_counter() - start_time
+    
     # Convert to numpy: [1, 1, H, W] -> [H, W]
     pred_mask_np = pred_mask[0, 0].cpu().numpy().astype(np.uint8)
     
-    return pred_mask_np
+    return pred_mask_np, inference_time
 
 
 def save_prediction(
@@ -196,6 +199,27 @@ def compute_metrics_numpy(pred_mask: np.ndarray, gt_mask: np.ndarray) -> dict:
         'dice': float(dice),
         'iou': float(iou)
     }
+
+
+def sanitize_prompt_for_filename(prompt: str) -> str:
+    """
+    Sanitize prompt string for use in filenames.
+    
+    Args:
+        prompt: Original prompt string
+    
+    Returns:
+        Sanitized string safe for filenames
+    """
+    # Replace spaces with underscores
+    sanitized = prompt.replace(' ', '_')
+    # Remove or replace special characters
+    sanitized = ''.join(c if c.isalnum() or c in ('_', '-') else '' for c in sanitized)
+    # Limit length to avoid overly long filenames
+    max_length = 50
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length]
+    return sanitized
 
 
 def load_ground_truth_mask(image_path: Path, annotations_path: Path) -> Optional[np.ndarray]:
@@ -266,16 +290,18 @@ def visualize_prediction(
     gt_mask: Optional[np.ndarray] = None
 ):
     """
-    Create visualization overlay of prediction on original image.
-    If gt_mask is provided, creates side-by-side comparison.
+    Create visualization with three images side by side: Original, Ground Truth, Predicted.
+    If gt_mask is not provided, shows Original and Predicted only.
     
     Args:
         image_path: Path to original image
         mask: Binary mask [H, W] with values {0, 1}
         output_path: Path to save visualization
         alpha: Transparency of overlay (default: 0.5)
-        gt_mask: Optional ground truth mask for side-by-side comparison
+        gt_mask: Optional ground truth mask for comparison
     """
+    from PIL import ImageDraw, ImageFont
+    
     # Load original image
     image = Image.open(image_path).convert('RGB')
     image_array = np.array(image)
@@ -297,7 +323,7 @@ def visualize_prediction(
     # Ensure mask is in [0, 1] range
     mask = np.clip(mask, 0, 1)
     
-    def create_overlay(img_array, msk, title=""):
+    def create_overlay(img_array, msk):
         """Helper function to create overlay visualization."""
         overlay = img_array.astype(np.float32).copy()
         mask_3d = np.stack([msk] * 3, axis=-1)  # [H, W, 3]
@@ -307,10 +333,51 @@ def visualize_prediction(
                           overlay)
         return overlay.astype(np.uint8)
     
+    def add_label(img_array, label_text):
+        """Add text label to image."""
+        img = Image.fromarray(img_array)
+        draw = ImageDraw.Draw(img)
+        
+        # Try to use a nice font, fallback to default if not available
+        try:
+            # Try to use a larger font
+            font_size = max(20, img.height // 25)
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", max(20, img.height // 25))
+            except:
+                font = ImageFont.load_default()
+        
+        # Get text bounding box
+        bbox = draw.textbbox((0, 0), label_text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        # Position text at top-left with padding
+        padding = 10
+        x = padding
+        y = padding
+        
+        # Draw background rectangle for text (solid black with white border)
+        draw.rectangle(
+            [x - 5, y - 5, x + text_width + 5, y + text_height + 5],
+            fill=(0, 0, 0),  # Black background
+            outline=(255, 255, 255)  # White border
+        )
+        
+        # Draw text
+        draw.text((x, y), label_text, fill=(255, 255, 255), font=font)
+        
+        return np.array(img)
+    
+    # Create original image (no overlay)
+    original_image = image_array.copy()
+    
     # Create prediction overlay
     pred_overlay = create_overlay(image_array, mask)
     
-    # If ground truth mask provided, create side-by-side comparison
+    # If ground truth mask provided, create three-panel visualization
     if gt_mask is not None:
         # Process ground truth mask
         if gt_mask.ndim > 2:
@@ -325,19 +392,26 @@ def visualize_prediction(
         # Create ground truth overlay
         gt_overlay = create_overlay(image_array, gt_mask)
         
-        # Create side-by-side image
-        combined = np.hstack([pred_overlay, gt_overlay])
+        # Add labels to each image
+        original_labeled = add_label(original_image, "Original")
+        gt_labeled = add_label(gt_overlay, "Ground Truth")
+        pred_labeled = add_label(pred_overlay, "Predicted")
         
-        # Add text labels (simple approach - could use PIL ImageDraw for better text)
-        # For now, save as is - labels can be added with image editing tools if needed
+        # Create side-by-side image: Original | Ground Truth | Predicted
+        combined = np.hstack([original_labeled, gt_labeled, pred_labeled])
+        
         combined_image = Image.fromarray(combined)
         combined_image.save(output_path)
-        print(f"Saved side-by-side visualization (Prediction | Ground Truth) to {output_path}")
+        print(f"Saved three-panel visualization (Original | Ground Truth | Predicted) to {output_path}")
     else:
-        # Single image with prediction overlay
-        overlay_image = Image.fromarray(pred_overlay)
-        overlay_image.save(output_path)
-        print(f"Saved visualization to {output_path}")
+        # Two-panel visualization: Original | Predicted
+        original_labeled = add_label(original_image, "Original")
+        pred_labeled = add_label(pred_overlay, "Predicted")
+        
+        combined = np.hstack([original_labeled, pred_labeled])
+        combined_image = Image.fromarray(combined)
+        combined_image.save(output_path)
+        print(f"Saved two-panel visualization (Original | Predicted) to {output_path}")
 
 
 def main():
@@ -399,18 +473,21 @@ def main():
         
         # Run inference
         print(f"\nRunning inference with prompt: '{args.prompt}'...")
-        mask = predict(model, image_tensor, args.prompt, device, args.threshold)
+        mask, inference_time = predict(model, image_tensor, args.prompt, device, args.threshold)
         
         # Calculate mask statistics
         mask_area = np.sum(mask)
         total_pixels = mask.shape[0] * mask.shape[1]
         coverage = (mask_area / total_pixels) * 100
         print(f"Predicted mask coverage: {coverage:.2f}% ({mask_area}/{total_pixels} pixels)")
+        print(f"Inference time: {inference_time*1000:.2f} ms")
         
         # Determine output path
+        image_path = Path(args.image)
+        sanitized_prompt = sanitize_prompt_for_filename(args.prompt)
+        
         if args.output is None:
-            image_path = Path(args.image)
-            output_path = image_path.parent / f"{image_path.stem}_mask.png"
+            output_path = image_path.parent / f"{image_path.stem}_{sanitized_prompt}_mask.png"
         else:
             output_path = Path(args.output)
         
@@ -422,8 +499,7 @@ def main():
             visualize_prediction(args.image, mask, args.visualization)
         elif args.visualization is None:
             # Auto-generate visualization path
-            image_path = Path(args.image)
-            vis_path = image_path.parent / f"{image_path.stem}_overlay.png"
+            vis_path = image_path.parent / f"{image_path.stem}_{sanitized_prompt}_overlay.png"
             visualize_prediction(args.image, mask, str(vis_path))
         
         print("\nInference completed!")
@@ -491,6 +567,7 @@ def main():
         total_coverage = 0.0
         total_dice = 0.0
         total_iou = 0.0
+        total_inference_time = 0.0
         metrics_count = 0
         
         for idx, image_file in enumerate(image_files, 1):
@@ -501,7 +578,8 @@ def main():
                 image_tensor, original_size = preprocess_image(str(image_file))
                 
                 # Run inference
-                mask = predict(model, image_tensor, args.prompt, device, args.threshold)
+                mask, inference_time = predict(model, image_tensor, args.prompt, device, args.threshold)
+                total_inference_time += inference_time
                 
                 # Calculate mask statistics
                 mask_area = np.sum(mask)
@@ -523,15 +601,18 @@ def main():
                     metrics_count += 1
                     metrics_str = f" | Dice: {metrics['dice']:.4f} | IoU: {metrics['iou']:.4f}"
                 
-                print(f"  Coverage: {coverage:.2f}% ({mask_area}/{total_pixels} pixels){metrics_str}")
+                print(f"  Coverage: {coverage:.2f}% ({mask_area}/{total_pixels} pixels) | Inference time: {inference_time*1000:.2f} ms{metrics_str}")
+                
+                # Create sanitized prompt for filename
+                sanitized_prompt = sanitize_prompt_for_filename(args.prompt)
                 
                 # Save prediction mask
-                output_path = output_dir / f"{image_file.stem}_mask.png"
+                output_path = output_dir / f"{image_file.stem}_{sanitized_prompt}_mask.png"
                 save_prediction(mask, str(output_path), original_size)
                 
                 # Save visualization if requested
                 if args.save_visualizations:
-                    vis_path = vis_dir / f"{image_file.stem}_overlay.png"
+                    vis_path = vis_dir / f"{image_file.stem}_{sanitized_prompt}_overlay.png"
                     visualize_prediction(str(image_file), mask, str(vis_path), gt_mask=gt_mask)
                 
             except Exception as e:
@@ -540,9 +621,15 @@ def main():
         
         # Print summary
         avg_coverage = total_coverage / len(image_files) if len(image_files) > 0 else 0.0
+        avg_inference_time = total_inference_time / len(image_files) if len(image_files) > 0 else 0.0
+        total_time = total_inference_time
+        
         print(f"\n=== Batch Inference Summary ===")
         print(f"Processed: {len(image_files)} image(s)")
         print(f"Average coverage: {avg_coverage:.2f}%")
+        print(f"Total inference time: {total_time:.2f} s ({total_time*1000:.2f} ms)")
+        print(f"Average inference time: {avg_inference_time:.4f} s ({avg_inference_time*1000:.2f} ms)")
+        print(f"Throughput: {len(image_files) / total_time:.2f} images/s" if total_time > 0 else "Throughput: N/A")
         
         if metrics_count > 0:
             avg_dice = total_dice / metrics_count

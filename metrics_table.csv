@@ -1,0 +1,21 @@
+Prompt,Dataset,mIoU,DICE
+segment crack,cracks,0.4560,0.5934
+segment cracks,cracks,0.4530,0.5905
+segment wall crack,cracks,0.4480,0.5862
+segment wall cracks,cracks,0.4507,0.5890
+segment surface crack,cracks,0.4481,0.5860
+segment surface cracks,cracks,0.4517,0.5900
+segment drywall crack,cracks,0.4521,0.5905
+segment drywall cracks,cracks,0.4473,0.5859
+find crack,cracks,0.4436,0.5817
+find cracks,cracks,0.4414,0.5793
+detect crack region,cracks,0.4402,0.5785
+detect crack regions,cracks,0.4449,0.5833
+segment taping area,drywall-post,0.6122,0.7293
+segment drywall tape,drywall-post,0.6327,0.7464
+segment wall joint,drywall-post,0.6365,0.7504
+segment drywall seam,drywall-post,0.6296,0.7445
+segment taped joint,drywall-post,0.6305,0.7460
+segment joint area,drywall-post,0.6234,0.7387
+find drywall seam,drywall-post,0.6270,0.7423
+detect taping region,drywall-post,0.5932,0.7166
