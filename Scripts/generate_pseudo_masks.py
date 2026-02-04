@@ -672,6 +672,9 @@ def process_dataset(
     annotations_path: str,
     output_dir: str,
     num_images: Optional[int] = None,
+    train_ratio: float = 0.8,
+    valid_ratio: float = 0.1,
+    test_ratio: float = 0.1,
     edge_detector_type: str = "canny",
     canny_low_threshold: float = 50.0,
     canny_high_threshold: float = 150.0,
@@ -695,8 +698,11 @@ def process_dataset(
     Args:
         data_root: Path to dataset root directory containing images
         annotations_path: Path to COCO format annotations JSON file
-        output_dir: Directory to save generated masks and visualizations
+        output_dir: Directory to save generated splits and visualizations
         num_images: Number of images to process (None for all)
+        train_ratio: Ratio of images for training (default: 0.8)
+        valid_ratio: Ratio of images for validation (default: 0.1)
+        test_ratio: Ratio of images for testing (default: 0.1)
         edge_detector_type: "canny" or "sobel"
         canny_low_threshold: Lower threshold for Canny edge detector
         canny_high_threshold: Upper threshold for Canny edge detector
@@ -714,14 +720,21 @@ def process_dataset(
         frangi_dilation_kernel: Dilation kernel size for Frangi mask
         edge_pixel_threshold: Minimum number of edge pixels to consider edge detection successful
     """
+    # Validate split ratios
+    if abs(train_ratio + valid_ratio + test_ratio - 1.0) > 1e-6:
+        raise ValueError(f"Split ratios must sum to 1.0, got: train={train_ratio}, valid={valid_ratio}, test={test_ratio}")
+    
     # Create output directories
     output_path = Path(output_dir)
-    masks_dir = output_path / "masks"
     visualizations_dir = output_path / "visualizations"
     train_dir = output_path / "train"
-    masks_dir.mkdir(parents=True, exist_ok=True)
+    valid_dir = output_path / "valid"
+    test_dir = output_path / "test"
+    
     visualizations_dir.mkdir(parents=True, exist_ok=True)
     train_dir.mkdir(parents=True, exist_ok=True)
+    valid_dir.mkdir(parents=True, exist_ok=True)
+    test_dir.mkdir(parents=True, exist_ok=True)
     
     # Load annotations
     print(f"Loading annotations from {annotations_path}...")
@@ -741,36 +754,65 @@ def process_dataset(
     if num_images is not None:
         image_ids = image_ids[:num_images]
     
-    print(f"Processing {len(image_ids)} images...")
+    # Shuffle image IDs for random split
+    np.random.shuffle(image_ids)
     
-    # Initialize COCO format data structure
-    coco_output = {
-        "info": {
-            "description": "Pseudo segmentation masks generated from bounding box annotations",
-            "version": "1.0"
-        },
-        "licenses": [],
-        "images": [],
-        "annotations": [],
-        "categories": coco_data.get("categories", [])
-    }
+    # Split image IDs into train/valid/test
+    total_images = len(image_ids)
+    train_end = int(total_images * train_ratio)
+    valid_end = train_end + int(total_images * valid_ratio)
+    
+    train_ids = image_ids[:train_end]
+    valid_ids = image_ids[train_end:valid_end]
+    test_ids = image_ids[valid_end:]
+    
+    print(f"Processing {total_images} images...")
+    print(f"Split: train={len(train_ids)} ({len(train_ids)/total_images*100:.1f}%), "
+          f"valid={len(valid_ids)} ({len(valid_ids)/total_images*100:.1f}%), "
+          f"test={len(test_ids)} ({len(test_ids)/total_images*100:.1f}%)")
+    
+    # Initialize COCO format data structures for each split
+    def create_coco_structure():
+        return {
+            "info": {
+                "description": "Pseudo segmentation masks generated from bounding box annotations",
+                "version": "1.0"
+            },
+            "licenses": [],
+            "images": [],
+            "annotations": [],
+            "categories": coco_data.get("categories", [])
+        }
+    
+    coco_train = create_coco_structure()
+    coco_valid = create_coco_structure()
+    coco_test = create_coco_structure()
     
     # If no categories exist, create a default one
-    if not coco_output["categories"]:
-        coco_output["categories"] = [{
+    if not coco_train["categories"]:
+        default_category = [{
             "id": 1,
             "name": "taping_area",
             "supercategory": "drywall"
         }]
+        coco_train["categories"] = default_category
+        coco_valid["categories"] = default_category
+        coco_test["categories"] = default_category
     
     # Get category ID (use first category or default to 1)
-    category_id = coco_output["categories"][0]["id"] if coco_output["categories"] else 1
+    category_id = coco_train["categories"][0]["id"] if coco_train["categories"] else 1
     
-    annotation_id = 1
-    new_image_id = 1
+    # Track annotation and image IDs per split
+    train_annotation_id = 1
+    train_image_id = 1
+    valid_annotation_id = 1
+    valid_image_id = 1
+    test_annotation_id = 1
+    test_image_id = 1
     
     # Process each image
-    for image_id in tqdm(image_ids, desc="Processing images"):
+    all_image_ids = train_ids + valid_ids + test_ids
+    for image_id in tqdm(all_image_ids, desc="Processing images"):
         img_info = images_dict[image_id]
         img_filename = img_info['file_name']
         img_path = Path(data_root) / img_filename
@@ -788,10 +830,27 @@ def process_dataset(
         # Convert BGR to RGB
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Copy image to train directory
-        train_img_path = train_dir / img_filename
+        # Determine which split this image belongs to
+        if image_id in train_ids:
+            split_dir = train_dir
+            coco_output = coco_train
+            current_image_id = train_image_id
+            current_annotation_id = train_annotation_id
+        elif image_id in valid_ids:
+            split_dir = valid_dir
+            coco_output = coco_valid
+            current_image_id = valid_image_id
+            current_annotation_id = valid_annotation_id
+        else:  # test
+            split_dir = test_dir
+            coco_output = coco_test
+            current_image_id = test_image_id
+            current_annotation_id = test_annotation_id
+        
+        # Copy image to appropriate split directory
+        split_img_path = split_dir / img_filename
         # Save image in RGB format (convert back to BGR for OpenCV save)
-        cv2.imwrite(str(train_img_path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(split_img_path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         
         # Initialize combined mask for this image
         combined_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
@@ -826,12 +885,6 @@ def process_dataset(
             # Combine masks (union)
             combined_mask = np.maximum(combined_mask, mask)
         
-        # Save combined mask
-        mask_filename = Path(img_filename).stem + ".png"
-        mask_path = masks_dir / mask_filename
-        mask_image = Image.fromarray(combined_mask, mode='L')
-        mask_image.save(mask_path)
-        
         # Create and save visualization
         vis_path = visualizations_dir / (Path(img_filename).stem + "_overlay.png")
         # Use first bbox for visualization (or combined)
@@ -848,7 +901,7 @@ def process_dataset(
         if np.sum(combined_mask > 0) > 0:
             # Add image entry
             coco_output["images"].append({
-                "id": new_image_id,
+                "id": current_image_id,
                 "width": image.shape[1],
                 "height": image.shape[0],
                 "file_name": img_filename
@@ -872,8 +925,8 @@ def process_dataset(
             
             # Add annotation entry
             coco_output["annotations"].append({
-                "id": annotation_id,
-                "image_id": new_image_id,
+                "id": current_annotation_id,
+                "image_id": current_image_id,
                 "category_id": category_id,
                 "segmentation": segmentation,
                 "area": area,
@@ -881,21 +934,46 @@ def process_dataset(
                 "iscrowd": 0
             })
             
-            annotation_id += 1
-            new_image_id += 1
+            # Update counters for the appropriate split
+            if image_id in train_ids:
+                train_annotation_id += 1
+                train_image_id += 1
+            elif image_id in valid_ids:
+                valid_annotation_id += 1
+                valid_image_id += 1
+            else:  # test
+                test_annotation_id += 1
+                test_image_id += 1
     
-    # Save COCO format annotations
-    coco_annotations_path = train_dir / "_annotations.coco.json"
-    with open(coco_annotations_path, 'w') as f:
-        json.dump(coco_output, f, indent=2)
+    # Save COCO format annotations for each split
+    train_annotations_path = train_dir / "_annotations.coco.json"
+    valid_annotations_path = valid_dir / "_annotations.coco.json"
+    test_annotations_path = test_dir / "_annotations.coco.json"
+    
+    with open(train_annotations_path, 'w') as f:
+        json.dump(coco_train, f, indent=2)
+    with open(valid_annotations_path, 'w') as f:
+        json.dump(coco_valid, f, indent=2)
+    with open(test_annotations_path, 'w') as f:
+        json.dump(coco_test, f, indent=2)
     
     print(f"\nProcessing complete!")
-    print(f"Masks saved to: {masks_dir}")
     print(f"Visualizations saved to: {visualizations_dir}")
-    print(f"Train images and COCO annotations saved to: {train_dir}")
-    print(f"COCO annotations file: {coco_annotations_path}")
-    print(f"Total images in COCO format: {len(coco_output['images'])}")
-    print(f"Total annotations in COCO format: {len(coco_output['annotations'])}")
+    print(f"\nTrain split:")
+    print(f"  Images: {train_dir}")
+    print(f"  COCO annotations: {train_annotations_path}")
+    print(f"  Total images: {len(coco_train['images'])}")
+    print(f"  Total annotations: {len(coco_train['annotations'])}")
+    print(f"\nValid split:")
+    print(f"  Images: {valid_dir}")
+    print(f"  COCO annotations: {valid_annotations_path}")
+    print(f"  Total images: {len(coco_valid['images'])}")
+    print(f"  Total annotations: {len(coco_valid['annotations'])}")
+    print(f"\nTest split:")
+    print(f"  Images: {test_dir}")
+    print(f"  COCO annotations: {test_annotations_path}")
+    print(f"  Total images: {len(coco_test['images'])}")
+    print(f"  Total annotations: {len(coco_test['annotations'])}")
 
 
 def load_config(config_path: str) -> Dict:
@@ -920,6 +998,9 @@ def load_config(config_path: str) -> Dict:
     # Set defaults for optional fields
     defaults = {
         'num_images': None,
+        'train_ratio': 0.8,
+        'valid_ratio': 0.1,
+        'test_ratio': 0.1,
         'edge_detector_type': 'canny',
         'canny_low_threshold': 50.0,
         'canny_high_threshold': 150.0,
@@ -960,6 +1041,9 @@ def main():
             "annotations_path": "Dataset/cracks/train/_annotations.coco.json",
             "output_dir": "output/pseudo_masks",
             "num_images": None,
+            "train_ratio": 0.8,
+            "valid_ratio": 0.1,
+            "test_ratio": 0.1,
             "edge_detector_type": "canny",
             "canny_low_threshold": 50.0,
             "canny_high_threshold": 150.0,
@@ -1000,6 +1084,9 @@ def main():
         annotations_path=config['annotations_path'],
         output_dir=config['output_dir'],
         num_images=config['num_images'],
+        train_ratio=config['train_ratio'],
+        valid_ratio=config['valid_ratio'],
+        test_ratio=config['test_ratio'],
         edge_detector_type=config['edge_detector_type'],
         canny_low_threshold=config['canny_low_threshold'],
         canny_high_threshold=config['canny_high_threshold'],

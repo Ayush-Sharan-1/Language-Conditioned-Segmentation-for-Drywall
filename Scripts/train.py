@@ -14,13 +14,14 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, ConcatDataset
+from torch.utils.data import DataLoader, Dataset, ConcatDataset, BatchSampler, Sampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torchvision.transforms as transforms
 from datetime import datetime
 from PIL import Image
+from collections import defaultdict
 
 from dataset import CrackSegmentationDataset
 from model import LanguageConditionedSegmentationModel
@@ -237,6 +238,73 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = True
 
 
+class ClassGroupedBatchSampler(BatchSampler):
+    """
+    Batch sampler that groups samples by class, ensuring each batch contains only one class.
+    This allows using a single prompt per batch for better performance.
+    """
+    
+    def __init__(self, dataset: Dataset, batch_size: int, shuffle: bool = True, seed: Optional[int] = None):
+        """
+        Args:
+            dataset: Dataset that returns (image, mask, class_label)
+            batch_size: Batch size
+            shuffle: Whether to shuffle batches (not individual samples)
+            seed: Random seed for reproducibility
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        # Group indices by class
+        self.class_indices = defaultdict(list)
+        print("Grouping samples by class for efficient batching...")
+        for idx in range(len(dataset)):
+            # Get class label by accessing dataset
+            _, _, class_label = dataset[idx]
+            self.class_indices[class_label].append(idx)
+        
+        print(f"  Found classes: {list(self.class_indices.keys())}")
+        for class_name, indices in self.class_indices.items():
+            print(f"    {class_name}: {len(indices)} samples")
+        
+        # Create batches for each class
+        self.batches = []
+        self.batch_classes = []  # Track which class each batch belongs to
+        for class_name, indices in self.class_indices.items():
+            # Shuffle indices within each class
+            if shuffle and seed is not None:
+                rng = random.Random(seed + hash(class_name))
+                rng.shuffle(indices)
+            elif shuffle:
+                random.shuffle(indices)
+            
+            # Create batches from this class
+            for i in range(0, len(indices), batch_size):
+                batch = indices[i:i + batch_size]
+                self.batches.append(batch)
+                self.batch_classes.append(class_name)
+        
+        # Shuffle batches across classes
+        if shuffle:
+            if seed is not None:
+                random.seed(seed)
+            # Shuffle batches and their corresponding class labels together
+            combined = list(zip(self.batches, self.batch_classes))
+            random.shuffle(combined)
+            self.batches, self.batch_classes = zip(*combined)
+            self.batches = list(self.batches)
+            self.batch_classes = list(self.batch_classes)
+        
+        print(f"  Created {len(self.batches)} batches (grouped by class)")
+    
+    def __iter__(self):
+        return iter(self.batches)
+    
+    def __len__(self):
+        return len(self.batches)
+
+
 def compute_metrics(
     predictions: torch.Tensor, 
     targets: torch.Tensor,
@@ -318,6 +386,10 @@ def train_epoch(
     bce_loss_fn = nn.BCEWithLogitsLoss()
     dice_loss_fn = DiceLoss()
     
+    # Get batch sampler to access class information
+    batch_sampler = getattr(dataloader, 'batch_sampler', None)
+    has_class_grouping = isinstance(batch_sampler, ClassGroupedBatchSampler)
+    
     for batch_idx, batch_data in enumerate(dataloader):
         # All datasets return (image, mask, class_label)
         images, masks, class_labels = batch_data
@@ -338,29 +410,49 @@ def train_epoch(
             images = images.to(memory_format=torch.channels_last)
             masks = masks.to(memory_format=torch.channels_last)
         
-        # Sample prompts for each sample in batch
-        batch_size = images.shape[0]
-        text_embeddings = []
-        
-        for i in range(batch_size):
-            class_label = class_labels[i] if isinstance(class_labels, (list, tuple)) else class_labels
-            is_negative = is_negative_flags[i].item()
+        # With class-grouped batching, all samples in batch have the same class (except negative samples)
+        # So we can use a single prompt for the batch - much faster!
+        if has_class_grouping:
+            # Get the class name for this batch from the sampler
+            batch_class_name = batch_sampler.batch_classes[batch_idx]
+            # Sample one prompt for the entire batch
+            prompt = sample_prompt(batch_class_name, prompts, is_training=True)
+            text_embedding = prompt_embeddings_cache[prompt]
+            if text_embedding.shape[0] == 1:
+                text_embedding = text_embedding.squeeze(0)  # [1, text_dim] -> [text_dim]
+            text_embedding = text_embedding.to(device)  # Single GPU transfer per batch!
+            # Expand to batch size (model will handle this, but we can do it explicitly)
+            text_embedding_batch = text_embedding.unsqueeze(0).expand(batch_size, -1)
             
-            if is_negative:
-                negative_count += 1
-            else:
-                positive_count += 1
+            # Count positive/negative samples
+            positive_count += (~is_negative_flags).sum().item()
+            negative_count += is_negative_flags.sum().item()
+        else:
+            # Fallback: handle mixed batches (shouldn't happen with ClassGroupedBatchSampler)
+            prompts_list = []
+            for i in range(batch_size):
+                class_label = class_labels[i] if isinstance(class_labels, (list, tuple)) else class_labels
+                is_negative = is_negative_flags[i].item()
+                
+                if is_negative:
+                    negative_count += 1
+                else:
+                    positive_count += 1
+                
+                prompt = sample_prompt(class_label, prompts, is_training=True)
+                prompts_list.append(prompt)
             
-            # Use prompt for the class_label (which may be mismatched for negative samples)
-            prompt = sample_prompt(class_label, prompts, is_training=True)
-            # Get embedding and squeeze if it has batch dimension of 1
-            emb = prompt_embeddings_cache[prompt].to(device)
-            if emb.shape[0] == 1:
-                emb = emb.squeeze(0)  # [1, text_dim] -> [text_dim]
-            text_embeddings.append(emb)
-        
-        # Stack text embeddings: [B, text_dim]
-        text_embedding_batch = torch.stack(text_embeddings, dim=0)
+            # Get unique prompts and transfer to device in one batch
+            unique_prompts = list(set(prompts_list))
+            unique_embeddings = {}
+            for prompt in unique_prompts:
+                emb = prompt_embeddings_cache[prompt]
+                if emb.shape[0] == 1:
+                    emb = emb.squeeze(0)
+                unique_embeddings[prompt] = emb.to(device)
+            
+            text_embeddings = [unique_embeddings[prompt] for prompt in prompts_list]
+            text_embedding_batch = torch.stack(text_embeddings, dim=0)
         
         # Forward pass
         optimizer.zero_grad()
@@ -513,17 +605,25 @@ def validate(
             
             # Use fixed prompts for validation
             batch_size = images.shape[0]
-            text_embeddings = []
+            prompts_list = []
             
             for i in range(batch_size):
                 class_label = class_labels[i] if isinstance(class_labels, (list, tuple)) else class_labels
                 # Use validation prompt for this class
                 val_prompt = val_prompts.get(class_label, list(val_prompts.values())[0])
-                emb = prompt_embeddings_cache[val_prompt].to(device)
+                prompts_list.append(val_prompt)
+            
+            # Get unique prompts and transfer to device in one batch (optimization)
+            unique_prompts = list(set(prompts_list))
+            unique_embeddings = {}
+            for prompt in unique_prompts:
+                emb = prompt_embeddings_cache[prompt]
                 if emb.shape[0] == 1:
                     emb = emb.squeeze(0)  # [1, text_dim] -> [text_dim]
-                text_embeddings.append(emb)
+                unique_embeddings[prompt] = emb.to(device)  # Transfer once per unique prompt
             
+            # Map embeddings to samples and stack
+            text_embeddings = [unique_embeddings[prompt] for prompt in prompts_list]
             text_embedding_batch = torch.stack(text_embeddings, dim=0)
             
             # Forward pass
@@ -910,11 +1010,17 @@ def main():
     else:
         val_dataset = val_datasets[0]
     
-    # Create dataloaders
-    train_loader = DataLoader(
+    # Create dataloaders with class-grouped batching for better performance
+    # This ensures each batch contains only one class, allowing single prompt per batch
+    train_batch_sampler = ClassGroupedBatchSampler(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        seed=args.seed
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_batch_sampler,
         num_workers=4,
         pin_memory=True if torch.cuda.is_available() else False
     )
