@@ -1,6 +1,7 @@
 pillow>=8.0.0
 numpy>=1.21.0
 opencv-python>=4.5.0
+scikit-image>=0.19.0
 pycocotools>=2.0.4
 ftfy
 regex

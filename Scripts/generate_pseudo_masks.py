@@ -22,6 +22,13 @@ import cv2
 from tqdm import tqdm
 from PIL import Image
 
+try:
+    from skimage.filters import frangi
+    FRANGI_AVAILABLE = True
+except ImportError:
+    FRANGI_AVAILABLE = False
+    print("Warning: scikit-image not available. Frangi ridge detection will be disabled.")
+
 
 def load_coco_annotations(annotations_path: str) -> Dict:
     """Load COCO format annotations from JSON file."""
@@ -271,6 +278,184 @@ def post_process_mask(mask: np.ndarray,
     return mask
 
 
+def detect_frangi_ridges(
+    crop: np.ndarray,
+    sigmas: List[float] = None,
+    beta1: float = 0.5,
+    beta2: float = 15.0,
+    black_ridges: bool = True
+) -> np.ndarray:
+    """
+    Detect ridges in the cropped region using Frangi filter.
+    
+    Args:
+        crop: Cropped image region [H, W, C] in RGB
+        sigmas: List of scales for multi-scale ridge detection (default: [1, 2, 3, 4, 5])
+        beta1: Frangi parameter for line-like structures (smaller = more line-like)
+        beta2: Frangi parameter to suppress blob-like responses
+        black_ridges: If True, detect dark ridges (default for drywall seams)
+    
+    Returns:
+        Frangi response map [H, W] with higher values at ridges
+    """
+    if not FRANGI_AVAILABLE:
+        return np.zeros((crop.shape[0], crop.shape[1]), dtype=np.float64)
+    
+    if sigmas is None:
+        sigmas = [1.0, 2.0, 3.0, 4.0, 5.0]
+    
+    # Convert to grayscale
+    if len(crop.shape) == 3:
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = crop
+    
+    # Normalize to [0, 1] for skimage
+    gray_normalized = gray.astype(np.float64) / 255.0
+    
+    # Apply Frangi filter
+    frangi_response = frangi(
+        gray_normalized,
+        sigmas=sigmas,
+        beta1=beta1,
+        beta2=beta2,
+        black_ridges=black_ridges
+    )
+    
+    return frangi_response
+
+
+def frangi_to_binary_mask(
+    frangi_response: np.ndarray,
+    threshold_percentile: float = 90.0,
+    threshold_absolute: Optional[float] = None
+) -> np.ndarray:
+    """
+    Convert Frangi response to binary mask using thresholding.
+    
+    Args:
+        frangi_response: Frangi filter response [H, W]
+        threshold_percentile: Percentile threshold (0-100) for top responses
+        threshold_absolute: Absolute threshold (if provided, overrides percentile)
+    
+    Returns:
+        Binary mask [H, W] with 1s at detected ridges
+    """
+    if threshold_absolute is not None:
+        threshold = threshold_absolute
+    else:
+        # Use percentile-based threshold
+        threshold = np.percentile(frangi_response, threshold_percentile)
+    
+    # Create binary mask
+    binary_mask = (frangi_response >= threshold).astype(np.uint8) * 255
+    
+    return binary_mask
+
+
+def filter_frangi_components(
+    mask: np.ndarray,
+    min_length: int = 10,
+    min_aspect_ratio: float = 2.0
+) -> np.ndarray:
+    """
+    Filter Frangi-derived components using geometric constraints.
+    
+    Args:
+        mask: Binary mask [H, W]
+        min_length: Minimum contour arc length in pixels
+        min_aspect_ratio: Minimum aspect ratio (length/width) for elongated structures
+    
+    Returns:
+        Filtered binary mask [H, W]
+    """
+    # Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    
+    filtered = np.zeros_like(mask)
+    
+    for contour in contours:
+        # Compute arc length
+        arc_length = cv2.arcLength(contour, closed=False)
+        
+        if arc_length < min_length:
+            continue
+        
+        # Compute bounding rectangle for aspect ratio
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Calculate aspect ratio (longer dimension / shorter dimension)
+        if w > 0 and h > 0:
+            aspect_ratio = max(w, h) / min(w, h)
+        else:
+            aspect_ratio = 0
+        
+        # Keep if elongated (aspect ratio >= min_aspect_ratio)
+        if aspect_ratio >= min_aspect_ratio:
+            cv2.drawContours(filtered, [contour], -1, 255, thickness=1)
+    
+    return filtered
+
+
+def apply_frangi_fallback(
+    crop: np.ndarray,
+    frangi_sigmas: List[float] = None,
+    frangi_beta1: float = 0.5,
+    frangi_beta2: float = 15.0,
+    frangi_threshold_percentile: float = 90.0,
+    frangi_threshold_absolute: Optional[float] = None,
+    frangi_min_length: int = 10,
+    frangi_dilation_kernel: int = 2
+) -> np.ndarray:
+    """
+    Apply Frangi ridge detection as fallback when edge detection fails.
+    
+    Args:
+        crop: Cropped image region [H, W, C] in RGB
+        frangi_sigmas: List of scales for Frangi filter
+        frangi_beta1: Frangi parameter for line-like structures
+        frangi_beta2: Frangi parameter to suppress blob-like responses
+        frangi_threshold_percentile: Percentile threshold for Frangi response
+        frangi_threshold_absolute: Absolute threshold (overrides percentile if provided)
+        frangi_min_length: Minimum contour length for Frangi components
+        frangi_dilation_kernel: Dilation kernel size for Frangi mask
+    
+    Returns:
+        Binary mask [H, W] from Frangi detection
+    """
+    if not FRANGI_AVAILABLE:
+        return np.zeros((crop.shape[0], crop.shape[1]), dtype=np.uint8)
+    
+    # Detect ridges using Frangi
+    frangi_response = detect_frangi_ridges(
+        crop,
+        sigmas=frangi_sigmas,
+        beta1=frangi_beta1,
+        beta2=frangi_beta2,
+        black_ridges=True
+    )
+    
+    # Convert to binary mask
+    mask = frangi_to_binary_mask(
+        frangi_response,
+        threshold_percentile=frangi_threshold_percentile,
+        threshold_absolute=frangi_threshold_absolute
+    )
+    
+    # Filter by geometric constraints
+    mask = filter_frangi_components(mask, min_length=frangi_min_length)
+    
+    # Apply small dilation to create usable mask width
+    if frangi_dilation_kernel > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (frangi_dilation_kernel, frangi_dilation_kernel)
+        )
+        mask = cv2.dilate(mask, kernel, iterations=1)
+    
+    return mask
+
+
 def convert_to_full_image_coords(
     mask: np.ndarray,
     image_shape: Tuple[int, int],
@@ -311,10 +496,20 @@ def process_single_bbox(
     color_difference_threshold: float = 15.0,
     min_edge_length: int = 10,
     dilation_kernel_size: int = 3,
-    erosion_kernel_size: int = 2
+    erosion_kernel_size: int = 2,
+    enable_frangi: bool = True,
+    frangi_sigmas: List[float] = None,
+    frangi_beta1: float = 0.5,
+    frangi_beta2: float = 15.0,
+    frangi_threshold_percentile: float = 90.0,
+    frangi_threshold_absolute: Optional[float] = None,
+    frangi_min_length: int = 10,
+    frangi_dilation_kernel: int = 2,
+    edge_pixel_threshold: int = 10
 ) -> np.ndarray:
     """
     Process a single bounding box to generate a segmentation mask.
+    Uses Frangi ridge detection as fallback when edge detection fails.
     
     Args:
         image: Full image [H, W, C]
@@ -326,6 +521,15 @@ def process_single_bbox(
         min_edge_length: Minimum edge length in pixels
         dilation_kernel_size: Dilation kernel size
         erosion_kernel_size: Erosion kernel size
+        enable_frangi: Whether to enable Frangi fallback
+        frangi_sigmas: List of scales for Frangi filter
+        frangi_beta1: Frangi parameter for line-like structures
+        frangi_beta2: Frangi parameter to suppress blob-like responses
+        frangi_threshold_percentile: Percentile threshold for Frangi response
+        frangi_threshold_absolute: Absolute threshold (overrides percentile if provided)
+        frangi_min_length: Minimum contour length for Frangi components
+        frangi_dilation_kernel: Dilation kernel size for Frangi mask
+        edge_pixel_threshold: Minimum number of edge pixels to consider edge detection successful
     
     Returns:
         Binary mask in full image coordinates [H, W]
@@ -347,12 +551,29 @@ def process_single_bbox(
     # Step 6: Filter short edges
     filtered_edges = filter_short_edges(filtered_edges, min_edge_length)
     
-    # Step 6 (continued): Post-process with morphological operations
-    mask_crop = post_process_mask(
-        filtered_edges,
-        dilation_kernel_size,
-        erosion_kernel_size
-    )
+    # Check if edge detection produced sufficient results
+    edge_pixel_count = np.sum(filtered_edges > 0)
+    use_frangi_fallback = enable_frangi and (edge_pixel_count < edge_pixel_threshold)
+    
+    if use_frangi_fallback:
+        # Use Frangi ridge detection as fallback
+        mask_crop = apply_frangi_fallback(
+            crop,
+            frangi_sigmas=frangi_sigmas,
+            frangi_beta1=frangi_beta1,
+            frangi_beta2=frangi_beta2,
+            frangi_threshold_percentile=frangi_threshold_percentile,
+            frangi_threshold_absolute=frangi_threshold_absolute,
+            frangi_min_length=frangi_min_length,
+            frangi_dilation_kernel=frangi_dilation_kernel
+        )
+    else:
+        # Step 6 (continued): Post-process with morphological operations
+        mask_crop = post_process_mask(
+            filtered_edges,
+            dilation_kernel_size,
+            erosion_kernel_size
+        )
     
     # Step 7: Convert back to full-image coordinates
     mask_full = convert_to_full_image_coords(
@@ -406,7 +627,16 @@ def process_dataset(
     color_difference_threshold: float = 15.0,
     min_edge_length: int = 10,
     dilation_kernel_size: int = 3,
-    erosion_kernel_size: int = 2
+    erosion_kernel_size: int = 2,
+    enable_frangi: bool = True,
+    frangi_sigmas: List[float] = None,
+    frangi_beta1: float = 0.5,
+    frangi_beta2: float = 15.0,
+    frangi_threshold_percentile: float = 90.0,
+    frangi_threshold_absolute: Optional[float] = None,
+    frangi_min_length: int = 10,
+    frangi_dilation_kernel: int = 2,
+    edge_pixel_threshold: int = 10
 ):
     """
     Main function to process the dataset and generate pseudo masks.
@@ -423,6 +653,15 @@ def process_dataset(
         min_edge_length: Minimum edge length in pixels
         dilation_kernel_size: Dilation kernel size for post-processing
         erosion_kernel_size: Erosion kernel size for post-processing
+        enable_frangi: Whether to enable Frangi fallback
+        frangi_sigmas: List of scales for Frangi filter
+        frangi_beta1: Frangi parameter for line-like structures
+        frangi_beta2: Frangi parameter to suppress blob-like responses
+        frangi_threshold_percentile: Percentile threshold for Frangi response
+        frangi_threshold_absolute: Absolute threshold (overrides percentile if provided)
+        frangi_min_length: Minimum contour length for Frangi components
+        frangi_dilation_kernel: Dilation kernel size for Frangi mask
+        edge_pixel_threshold: Minimum number of edge pixels to consider edge detection successful
     """
     # Create output directories
     output_path = Path(output_dir)
@@ -488,7 +727,16 @@ def process_dataset(
                 color_difference_threshold=color_difference_threshold,
                 min_edge_length=min_edge_length,
                 dilation_kernel_size=dilation_kernel_size,
-                erosion_kernel_size=erosion_kernel_size
+                erosion_kernel_size=erosion_kernel_size,
+                enable_frangi=enable_frangi,
+                frangi_sigmas=frangi_sigmas,
+                frangi_beta1=frangi_beta1,
+                frangi_beta2=frangi_beta2,
+                frangi_threshold_percentile=frangi_threshold_percentile,
+                frangi_threshold_absolute=frangi_threshold_absolute,
+                frangi_min_length=frangi_min_length,
+                frangi_dilation_kernel=frangi_dilation_kernel,
+                edge_pixel_threshold=edge_pixel_threshold
             )
             
             # Combine masks (union)
@@ -544,7 +792,16 @@ def load_config(config_path: str) -> Dict:
         'color_difference_threshold': 15.0,
         'min_edge_length': 10,
         'dilation_kernel_size': 3,
-        'erosion_kernel_size': 2
+        'erosion_kernel_size': 2,
+        'enable_frangi': True,
+        'frangi_sigmas': [1.0, 2.0, 3.0, 4.0, 5.0],
+        'frangi_beta1': 0.5,
+        'frangi_beta2': 15.0,
+        'frangi_threshold_percentile': 90.0,
+        'frangi_threshold_absolute': None,
+        'frangi_min_length': 10,
+        'frangi_dilation_kernel': 2,
+        'edge_pixel_threshold': 10
     }
     
     for key, default_value in defaults.items():
@@ -575,7 +832,16 @@ def main():
             "color_difference_threshold": 15.0,
             "min_edge_length": 10,
             "dilation_kernel_size": 3,
-            "erosion_kernel_size": 2
+            "erosion_kernel_size": 2,
+            "enable_frangi": True,
+            "frangi_sigmas": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "frangi_beta1": 0.5,
+            "frangi_beta2": 15.0,
+            "frangi_threshold_percentile": 90.0,
+            "frangi_threshold_absolute": None,
+            "frangi_min_length": 10,
+            "frangi_dilation_kernel": 2,
+            "edge_pixel_threshold": 10
         }
         print(json.dumps(example_config, indent=2))
         print("\nNote: Use 'null' instead of None in JSON files (or omit the field to use default)")
@@ -606,7 +872,16 @@ def main():
         color_difference_threshold=config['color_difference_threshold'],
         min_edge_length=config['min_edge_length'],
         dilation_kernel_size=config['dilation_kernel_size'],
-        erosion_kernel_size=config['erosion_kernel_size']
+        erosion_kernel_size=config['erosion_kernel_size'],
+        enable_frangi=config['enable_frangi'],
+        frangi_sigmas=config.get('frangi_sigmas'),
+        frangi_beta1=config['frangi_beta1'],
+        frangi_beta2=config['frangi_beta2'],
+        frangi_threshold_percentile=config['frangi_threshold_percentile'],
+        frangi_threshold_absolute=config.get('frangi_threshold_absolute'),
+        frangi_min_length=config['frangi_min_length'],
+        frangi_dilation_kernel=config['frangi_dilation_kernel'],
+        edge_pixel_threshold=config['edge_pixel_threshold']
     )
 
 

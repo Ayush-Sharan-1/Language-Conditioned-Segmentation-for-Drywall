@@ -2,13 +2,22 @@
   "data_root": "Dataset/drywall-pre/train",
   "annotations_path": "Dataset/drywall-pre/train/_annotations.coco.json",
   "output_dir": "Dataset/drywall-post",
-  "num_images": 50,
+  "num_images": null,
   "edge_detector_type": "canny",
   "canny_low_threshold": 20.0,
   "canny_high_threshold": 40.0,
   "color_difference_threshold": 15.0,
   "min_edge_length": 100,
   "dilation_kernel_size": 3,
-  "erosion_kernel_size": 2
+  "erosion_kernel_size": 2,
+  "enable_frangi": true,
+  "frangi_sigmas": [1.0, 2.0, 3.0, 4.0, 5.0],
+  "frangi_beta1": 0.5,
+  "frangi_beta2": 15.0,
+  "frangi_threshold_percentile": 90.0,
+  "frangi_threshold_absolute": null,
+  "frangi_min_length": 100,
+  "frangi_dilation_kernel": 2,
+  "edge_pixel_threshold": 10
 }
 
